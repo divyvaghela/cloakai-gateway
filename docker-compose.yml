@@ -10,8 +10,6 @@ services:
     volumes:
       - ./vault_storage.db:/app/vault_storage.db
       - ./secret_master.key:/app/secret_master.key
-      - ./audit_logs.csv:/app/audit_logs.csv
     environment:
       - PORT=8080
-      - FLASK_ENV=production
-      - LOG_LEVEL=INFO
+      - ENVIRONMENT=production
