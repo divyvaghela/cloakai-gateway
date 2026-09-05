@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  cloakai-gateway:
+    build: .
+    container_name: cloakai_enterprise_gateway
+    restart: always
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./vault_storage.db:/app/vault_storage.db
+      - ./secret_master.key:/app/secret_master.key
+      - ./audit_logs.csv:/app/audit_logs.csv
+    environment:
+      - PORT=8080
+      - FLASK_ENV=production
+      - LOG_LEVEL=INFO

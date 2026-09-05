@@ -1,0 +1,7 @@
+secret_master.key
+vault_storage.db
+audit_logs.csv
+CloakAI_Cryptographic_Audit_Ledger.csv
+__pycache__/
+*.pyc
+.env
