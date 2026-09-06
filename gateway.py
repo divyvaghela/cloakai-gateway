@@ -2,10 +2,9 @@ import os
 import io
 import csv
 import json
-import base64
-import sqlite3
 import time
 import hashlib
+import threading
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -17,34 +16,58 @@ import requests
 
 from masking_engine import DataMaskingEngine
 
-app = FastAPI(title="CloakAI Enterprise Gateway", version="3.2.0")
+app = FastAPI(title="CloakAI Enterprise Gateway", version="3.3.0-PROD")
 engine = DataMaskingEngine()
 
-# --- ૧. કાયમી AES-256 GCM માસ્ટર કી વ્યવસ્થાપન ---
-KEY_FILE = "secret_master.key"
-if os.path.exists(KEY_FILE):
-    with open(KEY_FILE, "rb") as kf:
-        AES_KEY = kf.read()
+# --- ૧. Enterprise KMS / Environment Master Key Loading ---
+ENV_KEY = os.getenv("CLOAKAI_MASTER_KEY")
+if ENV_KEY:
+    try:
+        AES_KEY = bytes.fromhex(ENV_KEY)
+    except Exception:
+        AES_KEY = ENV_KEY.encode()[:32].ljust(32, b'0')
 else:
-    AES_KEY = AESGCM.generate_key(bit_length=256)
-    with open(KEY_FILE, "wb") as kf:
-        kf.write(AES_KEY)
+    KEY_FILE = "secret_master.key"
+    if os.path.exists(KEY_FILE):
+        with open(KEY_FILE, "rb") as kf:
+            AES_KEY = kf.read()
+    else:
+        AES_KEY = AESGCM.generate_key(bit_length=256)
+        with open(KEY_FILE, "wb") as kf:
+            kf.write(AES_KEY)
 
 aesgcm = AESGCM(AES_KEY)
 
-# --- ૨. Persistent SQLite Vault સેટઅપ ---
-DB_FILE = "vault_storage.db"
-conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-cursor = conn.cursor()
-cursor.execute("""
-    CREATE TABLE IF NOT EXISTS secure_vault (
-        session_id TEXT PRIMARY KEY,
-        encrypted_vault BLOB,
-        nonce BLOB,
-        created_at TEXT
-    )
-""")
-conn.commit()
+# --- ૨. Ephemeral In-Memory Vault with Automatic TTL Zeroization ---
+VAULT_TTL_SECONDS = 300  # ૫ મિનિટ પછી ડેટા આપમેળે મેમરીમાંથી ડિલીટ
+EPHEMERAL_VAULT: Dict[str, Dict[str, Any]] = {}
+vault_lock = threading.Lock()
+
+def sweep_expired_vault_entries():
+    """બેકગ્રાઉન્ડ થ્રેડ જે એક્સપાયર થયેલા ટોકન મેપિંગ્સને મેમરીમાંથી ફ્લશ કરે છે."""
+    while True:
+        time.sleep(30)
+        current_ts = time.time()
+        with vault_lock:
+            expired_keys = [k for k, v in EPHEMERAL_VAULT.items() if current_ts - v["created_at"] > VAULT_TTL_SECONDS]
+            for k in expired_keys:
+                del EPHEMERAL_VAULT[k]
+
+cleanup_daemon = threading.Thread(target=sweep_expired_vault_entries, daemon=True)
+cleanup_daemon.start()
+
+def persist_vault_record(session_id: str, vault_dict: dict, timestamp_str: str):
+    vault_bytes = json.dumps(vault_dict).encode()
+    nonce = os.urandom(12)
+    encrypted_blob = aesgcm.encrypt(nonce, vault_bytes, None)
+    
+    with vault_lock:
+        EPHEMERAL_VAULT[session_id] = {
+            "encrypted_blob": encrypted_blob,
+            "nonce": nonce,
+            "created_at": time.time(),
+            "formatted_time": timestamp_str
+        }
 
 # --- ૩. Cryptographic Audit Ledger & DPDP Metrics ---
 AUDIT_METRICS: Dict[str, Any] = {
@@ -59,11 +82,9 @@ LAST_LEDGER_HASH = "000000000000000000000000000000000000000000000000000000000000
 LEDGER_RECORDS: List[Dict[str, Any]] = []
 
 def record_tamper_proof_audit(event_type: str, role: str, tokens_count: int, status: str):
-    """દરેક ઇવેન્ટને પાછલા બ્લોકના SHA-256 હેશ સાથે સાંકળીને ટેમ્પર-પ્રૂફ બનાવે છે."""
     global LAST_LEDGER_HASH
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
-    # DPDP Act દંડ બચત લોજિક: સંવેદનશીલ ડેટા અટકાવવા પર બચત
     penalty_value = 0.0
     if tokens_count > 0:
         penalty_value = min(250.0, tokens_count * 2.5)
@@ -86,16 +107,6 @@ def record_tamper_proof_audit(event_type: str, role: str, tokens_count: int, sta
     LAST_LEDGER_HASH = current_hash
     return current_hash
 
-def persist_vault_record(session_id: str, vault_dict: dict, timestamp_str: str):
-    vault_bytes = json.dumps(vault_dict).encode()
-    nonce = os.urandom(12)
-    encrypted_blob = aesgcm.encrypt(nonce, vault_bytes, None)
-    cursor.execute(
-        "INSERT INTO secure_vault (session_id, encrypted_vault, nonce, created_at) VALUES (?, ?, ?, ?)",
-        (session_id, encrypted_blob, nonce, timestamp_str)
-    )
-    conn.commit()
-
 class UserPromptRequest(BaseModel):
     prompt: str
     target_provider: str = "openai"
@@ -108,7 +119,7 @@ DASHBOARD_HTML = """
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>CloakAI - Enterprise Security Gateway 3.2</title>
+  <title>CloakAI - Enterprise Security Gateway 3.3 Production</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" />
   <style>
@@ -122,8 +133,8 @@ DASHBOARD_HTML = """
       <div class="flex items-center space-x-3">
         <i class="fa-solid fa-shield-halved text-cyan-400 text-3xl"></i>
         <div>
-          <h1 class="text-2xl font-bold tracking-wide text-white">Cloak<span class="text-cyan-400">AI</span> Gateway <span class="text-xs bg-cyan-950 text-cyan-400 border border-cyan-800 px-2 py-0.5 rounded">v3.2 DPDP & RBI Ready</span></h1>
-          <p class="text-xs text-slate-400">Verifiable SHA-256 Audit Chain | Verhoeff Aadhaar & Luhn Defense</p>
+          <h1 class="text-2xl font-bold tracking-wide text-white">Cloak<span class="text-cyan-400">AI</span> Gateway <span class="text-xs bg-cyan-950 text-cyan-400 border border-cyan-800 px-2 py-0.5 rounded">v3.3 Ephemeral TTL Ready</span></h1>
+          <p class="text-xs text-slate-400">Zero Persistent Disk Footprint | High-Throughput In-Memory Redaction Engine</p>
         </div>
       </div>
       <div class="flex items-center space-x-3">
@@ -131,12 +142,11 @@ DASHBOARD_HTML = """
           <i class="fa-solid fa-file-csv text-cyan-400"></i> Export Verifiable Audit
         </a>
         <span class="inline-flex items-center px-3 py-1.5 text-xs font-semibold text-emerald-400 bg-emerald-950/60 border border-emerald-800 rounded-full">
-          <span class="w-2 h-2 mr-2 bg-emerald-400 rounded-full animate-pulse"></span> SYSTEM ARMED
+          <span class="w-2 h-2 mr-2 bg-emerald-400 rounded-full animate-pulse"></span> PROD ENGINE ACTIVE
         </span>
       </div>
     </header>
 
-    <!-- 5-Metric Strip -->
     <div class="grid grid-cols-1 md:grid-cols-5 gap-4">
       <div class="p-4 bg-slate-900/70 rounded-xl border border-slate-800">
         <p class="text-xs text-slate-400 uppercase font-semibold">Total Intercepted</p>
@@ -168,7 +178,7 @@ DASHBOARD_HTML = """
               <i class="fa-solid fa-terminal text-cyan-400"></i> Corporate Prompt Interceptor
             </h2>
             <div class="space-x-1">
-              <button onclick="loadKyc()" class="text-xs text-cyan-400 hover:underline">KYC / Aadhaar</button>
+              <button onclick="loadKyc()" class="text-xs text-cyan-400 hover:underline">KYC Sample</button>
               <span class="text-slate-600">|</span>
               <button onclick="loadLeak()" class="text-xs text-rose-400 hover:underline">Secret Leak</button>
               <span class="text-slate-600">|</span>
@@ -202,10 +212,10 @@ DASHBOARD_HTML = """
 
       <div class="p-5 bg-slate-900/90 rounded-xl neon-border flex flex-col">
         <h2 class="text-sm font-semibold tracking-wider text-slate-300 uppercase mb-3 flex items-center gap-2">
-          <i class="fa-solid fa-database text-amber-400"></i> Encrypted In-Flight Vault (AES-256 GCM)
+          <i class="fa-solid fa-memory text-amber-400"></i> Ephemeral AES-256 Vault (Auto 300s TTL Flush)
         </h2>
         <div id="vaultBox" class="flex-1 bg-slate-950 border border-slate-800 rounded-lg p-3 overflow-y-auto max-h-64 font-mono text-xs space-y-2">
-          <div class="text-slate-500 italic">No prompt processed yet. KeyStore empty.</div>
+          <div class="text-slate-500 italic">KeyStore clean. In-memory mappings purged upon expiry.</div>
         </div>
       </div>
     </div>
@@ -228,7 +238,7 @@ DASHBOARD_HTML = """
 
   <script>
     function loadKyc() {
-      document.getElementById('promptInput').value = "Customer Rajesh Varma with PAN ABCDE9988Z and Card 4532015112830366 requested verification from HDFC Bank.";
+      document.getElementById('promptInput').value = "Customer Rajesh Varma with PAN ABCDE9988Z requested verification from HDFC Bank.";
     }
     function loadLeak() {
       document.getElementById('promptInput').value = "Production master secret api_key = 'sk-live-99238478234892348934' for ICICI DB.";
@@ -302,6 +312,11 @@ DASHBOARD_HTML = """
 async def serve_dashboard():
     return HTMLResponse(content=DASHBOARD_HTML)
 
+@app.get("/healthz")
+async def health_check():
+    """Enterprise Kubernetes Liveness Probe."""
+    return {"status": "HEALTHY", "version": "3.3.0-PROD", "timestamp": time.time()}
+
 @app.get("/v1/export-audit")
 async def export_audit():
     output = io.StringIO()
@@ -319,7 +334,6 @@ async def export_audit():
         headers={"Content-Disposition": "attachment; filename=CloakAI_Cryptographic_Audit_Ledger.csv"}
     )
 
-# --- ૪. ઇન્ટરનલ ડેશબોર્ડ UI એન્ડપોઇન્ટ ---
 @app.post("/v1/secure-chat")
 async def secure_chat(req: UserPromptRequest):
     if not req.prompt.strip():
@@ -328,7 +342,6 @@ async def secure_chat(req: UserPromptRequest):
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     AUDIT_METRICS["total_requests"] += 1
 
-    # ૧. Jailbreak & Prompt Injection Shield
     if engine.check_prompt_injection(req.prompt):
         AUDIT_METRICS["injection_attempts"] += 1
         record_tamper_proof_audit("INJECTION_ATTEMPT", req.user_role, 0, "IMMEDIATE_DROP")
@@ -338,10 +351,8 @@ async def secure_chat(req: UserPromptRequest):
             "metrics": AUDIT_METRICS
         }
 
-    # ૨. ડાયનેમિક માસ્કિંગ
     masked_prompt, vault = engine.mask_text(req.prompt)
 
-    # ૩. Hard DLP Check (API Keys)
     if any("API_KEY" in token for token in vault.keys()):
         AUDIT_METRICS["critical_blocks"] += 1
         record_tamper_proof_audit("SECRET_KEY_EXFILTRATION", req.user_role, len(vault), "DLP_TERMINATED")
@@ -351,7 +362,6 @@ async def secure_chat(req: UserPromptRequest):
             "metrics": AUDIT_METRICS
         }
 
-    # ૪. Persistent Vault માં સેવ & Cryptographic Audit રેકોર્ડ
     session_id = f"sess_{int(datetime.now().timestamp() * 1000)}"
     persist_vault_record(session_id, vault, now_str)
     AUDIT_METRICS["entities_shielded"] += len(vault)
@@ -360,7 +370,6 @@ async def secure_chat(req: UserPromptRequest):
     tokens_str = ", ".join(vault.keys()) if vault else "No Sensitive Entities"
     ai_raw = f"[{req.target_provider.upper()} Engine]: Processed safely for {tokens_str}. Verified against compliance rules."
 
-    # ૫. Role-Based Access Control (RBAC)
     if req.user_role == "USER":
         final_reply = ai_raw
     else:
@@ -376,7 +385,6 @@ async def secure_chat(req: UserPromptRequest):
         "metrics": AUDIT_METRICS
     }
 
-# --- ૫. OpenAI Drop-In Reverse Proxy એન્ડપોઇન્ટ (બેંક સોફ્ટવેર ઇન્ટિગ્રેશન) ---
 @app.post("/v1/chat/completions")
 async def drop_in_chat_completions(request: Request, authorization: Optional[str] = Header(None)):
     try:
@@ -392,7 +400,6 @@ async def drop_in_chat_completions(request: Request, authorization: Optional[str
     AUDIT_METRICS["total_requests"] += 1
     last_user_msg = messages[-1].get("content", "")
 
-    # ૧. Jailbreak Shield Check
     if engine.check_prompt_injection(last_user_msg):
         AUDIT_METRICS["injection_attempts"] += 1
         record_tamper_proof_audit("PROXY_JAILBREAK_ATTEMPT", "SERVICE_ACCOUNT", 0, "PROXY_DROP")
@@ -401,10 +408,8 @@ async def drop_in_chat_completions(request: Request, authorization: Optional[str
             content={"error": {"message": "Security Alert: Prompt Injection / System Override blocked.", "type": "security_violation"}}
         )
 
-    # ૨. ડાયનેમિક માસ્કિંગ
     masked_prompt, session_vault = engine.mask_text(last_user_msg)
 
-    # ૩. Hard DLP Check
     if any("API_KEY" in token for token in session_vault.keys()):
         AUDIT_METRICS["critical_blocks"] += 1
         record_tamper_proof_audit("PROXY_SECRET_LEAK", "SERVICE_ACCOUNT", len(session_vault), "DLP_DROP")
@@ -413,7 +418,6 @@ async def drop_in_chat_completions(request: Request, authorization: Optional[str
             content={"error": {"message": "DLP Violation: Production credentials leak intercepted.", "type": "dlp_violation"}}
         )
 
-    # ૪. Vault Storage & Cryptographic Audit Chain Entry
     session_id = f"proxy_{int(time.time() * 1000)}"
     persist_vault_record(session_id, session_vault, now_str)
     AUDIT_METRICS["entities_shielded"] += len(session_vault)
@@ -422,7 +426,6 @@ async def drop_in_chat_completions(request: Request, authorization: Optional[str
     messages[-1]["content"] = masked_prompt
     data["messages"] = messages
 
-    # ૫. Mock Mode vs Live Forwarding
     auth_header_val = authorization or ""
     if "mock" in auth_header_val.lower() or not auth_header_val or "Bearer sk-" not in auth_header_val:
         tokens_list = list(session_vault.keys())
